@@ -24,7 +24,7 @@ trait TestSpec extends FlatSpec with Matchers with ScalaFutures with TryValues w
   implicit val ec: ExecutionContext = system.dispatcher
   implicit val mat: Materializer = ActorMaterializer()
   implicit val log: LoggingAdapter = Logging(system, this.getClass)
-  implicit val pc: PatienceConfig = PatienceConfig(timeout = 60.seconds)
+  implicit val pc: PatienceConfig = PatienceConfig(timeout = 1.hour)
 
   final val TestPartnerFeed = "TestPartnerFeed.xml"
 

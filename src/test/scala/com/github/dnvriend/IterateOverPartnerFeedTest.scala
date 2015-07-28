@@ -1,14 +1,20 @@
 package com.github.dnvriend
 
 import java.io.InputStream
+
+import akka.stream.OverflowStrategy
 import akka.stream.scaladsl._
 import com.scalawilliam.xs4s.XmlStreamElementProcessor
 
-import scala.xml.Elem
+import scala.util.Try
+import scala.xml.{Elem, NodeSeq}
 
-case class Review(datum: String, door: String, gemiddeldeScore: Double, titel: String, bericht: String)
-case class Adres(straat: String, huisnummer: String, postcode: String, stad: String)
-case class Restaurant(id: Long, naam: String, adres: Option[Adres], telefoon: String, keukens: List[String], reviews: List[Review], gemiddeldeScore: Double, gemiddeldePrijsHoofdMenu: Double, couvertsURL: String, adWordsNaam: String)
+trait CouvertsDomain
+case class Reviews(xs: List[Review]) // wrapper for type erasure on collections
+case class Keukens(xs: List[String]) // wrapper for type erasure on collections
+case class Review(datum: String, door: String, gemiddeldeScore: Double, titel: String, bericht: String) extends CouvertsDomain
+case class Adres(straat: String, huisnummer: String, postcode: String, stad: String) extends CouvertsDomain
+case class Restaurant(id: Long, naam: String, adres: Option[Adres], telefoon: String, keukens: List[String], reviews: List[Review], gemiddeldeScore: Double, gemiddeldePrijsHoofdMenu: Double, couvertsURL: String, adWordsNaam: String) extends CouvertsDomain
 
 class IterateOverPartnerFeedTest extends TestSpec {
 
@@ -18,106 +24,95 @@ class IterateOverPartnerFeedTest extends TestSpec {
   def preProcessId: Flow[Xml, (RestaurantId, Xml), Unit] =
     Flow[Elem].map(xml => ((xml \ "Id").text.toLong, xml))
 
-  def processRestaurant: Flow[(RestaurantId, Xml), Restaurant, Unit] =
+  def processRestaurant: Flow[(RestaurantId, Xml), (RestaurantId, Restaurant), Unit] =
     Flow[(RestaurantId, Xml)].map {
-      case (restaurantId, xml) => Restaurant(
-        restaurantId, (xml \ "Naam").text, None, (xml \ "Telefoon").text, Nil, Nil, (xml \ "GemiddeldeScore").text.toDouble, (xml \ "GemiddeldePrijsHoofdMenu").text.toDouble, (xml \ "CouvertsURL").text, (xml \ "AdWordsNaam").text
-      )
+      case (restaurantId, xml) => (
+          restaurantId,
+          Restaurant(
+            restaurantId,
+            (xml \ "Naam").text, None,
+            (xml \ "Telefoon").text,
+            Nil,
+            Nil,
+            (xml \ "GemiddeldeScore").text.toDouble,
+            (xml \ "GemiddeldePrijsHoofdMenu").text.toDouble,
+            (xml \ "CouvertsURL").text,
+            (xml \ "AdWordsNaam").text)
+        )
     }
 
-  def processIdentity:  Flow[(RestaurantId, Xml), (RestaurantId, Xml), Unit] = Flow[(RestaurantId, Xml)].map(identity)
+  def processIdentity: Flow[(RestaurantId, Xml), (RestaurantId, Xml), Unit] = Flow[(RestaurantId, Xml)].map(identity)
 
-  def processAdres:  Flow[(RestaurantId, Xml), Adres, Unit] = Flow[(RestaurantId, Xml)].map {
-    case (restaurantId, xml) => ???
+  def mapKeukens(seq: NodeSeq): Keukens = Keukens(seq.map(_.text).toList)
+
+  def processKeukens = Flow[(RestaurantId, Xml)].map {
+    case (restaurantId, xml) => (restaurantId, mapKeukens(xml \\ "Keuken"))
   }
 
-  def processReview:  Flow[(RestaurantId, Xml), List[Review], Unit] = Flow[(RestaurantId, Xml)].map {
-    case (restaurantId, xml) => ???
+  def processAdres:  Flow[(RestaurantId, Xml), (RestaurantId, Adres), Unit] = Flow[(RestaurantId, Xml)].map {
+    case (restaurantId, xml) =>
+      val adresXml = xml \ "Adres"
+      (restaurantId, Adres((adresXml \ "Straat").text, (adresXml \ "Huisnummer").text, (adresXml \ "Postcode").text, (adresXml \ "Stad").text))
+  }
+
+  def mapReviews(seq: NodeSeq): List[Review] = {
+    seq.map(xml => Review((xml \ "Datum").text, (xml \ "Door").text, Try((xml \ "GemiddeldeScore").text.toDouble).getOrElse(0.0), (xml \ "Titel").text, (xml \ "Bericht").text)).toList
+  }
+
+  def processReview:  Flow[(RestaurantId, Xml), (RestaurantId, Reviews), Unit] = Flow[(RestaurantId, Xml)].map {
+    case (restaurantId, xml) => (restaurantId, Reviews(mapReviews(xml \\ "Review")))
+  }
+
+  def fanOutAndMerge = Flow() { implicit b =>
+    import FlowGraph.Implicits._
+    val nrPorts = 5
+    val bcast = b.add(Broadcast[(RestaurantId, Xml)](nrPorts))
+    val merge = b.add(Merge[(RestaurantId, AnyRef)](nrPorts))
+    bcast ~> processIdentity ~> merge
+    bcast ~> processAdres ~> merge
+    bcast ~> processReview ~> merge
+    bcast ~> processRestaurant ~> merge
+    bcast ~> processKeukens ~> merge
+    (bcast.in, merge.out)
   }
 
   val splitter = XmlStreamElementProcessor.collectElements { _.last == "Restaurant" }
+
+  def groupById = Flow[(RestaurantId, AnyRef)].groupBy {
+    case (restaurantId, _) => restaurantId
+  }
 
   "partnerfeed" should "iterate over xml" in {
     withInputStream(TestPartnerFeed) { (is: InputStream) =>
       import XmlStreamElementProcessor.IteratorCreator._
       val restaurantIterator: Iterator[Elem] = splitter.processInputStream(is)
-      Source( () => restaurantIterator )
+      Source(() => restaurantIterator)
         .via(preProcessId)
-        .via(processRestaurant)
+        .via(fanOutAndMerge)
+        .via(groupById)
+        .map {
+          case (id, stream) => stream.runFold(Restaurant(id, "", None, "", Nil, Nil, 0.0d, 0.0d, "", "")) {
+            case (restaurant, (_, adres: Adres)) => restaurant.copy(adres = Option(adres))
+            case (restaurant, (_, reviews: Reviews)) => restaurant.copy(reviews = reviews.xs)
+            case (restaurant, (_, r: Restaurant)) =>
+              restaurant.copy(
+                naam = r.naam,
+                telefoon = r.telefoon,
+                couvertsURL = r.couvertsURL,
+                gemiddeldeScore = r.gemiddeldeScore,
+                gemiddeldePrijsHoofdMenu = r.gemiddeldePrijsHoofdMenu,
+                adWordsNaam = r.adWordsNaam
+              )
+            case (restaurant, (_, keukens: Keukens)) => restaurant.copy(keukens = keukens.xs)
+            case (restaurant, m) => restaurant
+          }
+        }
+        // note, be sure to set the buffer as long as the records you wish to process
+        // see: http://doc.akka.io/docs/akka-stream-and-http-experimental/1.0/scala/stream-cookbook.html#Implementing_reduce-by-key
+        .buffer(100000, OverflowStrategy.fail)
+        .mapAsync(4)(identity)
         .runForeach(println)
         .toTry should be a 'success
     }
   }
 }
-
-/**
-<Restaurant>
-    <Id>1</Id>
-    <Naam>freek's restaurant</Naam>
-    <Adres>
-      <Straat>markt</Straat>
-      <Huisnummer>1</Huisnummer>
-      <Postcode>5611AX</Postcode>
-      <Stad>eindhoven</Stad>
-    </Adres>
-    <Telefoon>0357113011</Telefoon>
-    <Beschrijving />
-    <Email />
-    <Fotos>
-      <Foto>http://restaurant.testing.couverts.nl/upload/fotos/1/1de56d88-3fa1-4cfb-9755-0a835a6be8cf.jpg</Foto>
-      <Foto>http://restaurant.testing.couverts.nl/upload/fotos/1/3ffbd979-41d3-4bef-a203-beb4959031d1.jpg</Foto>
-      <Foto>http://restaurant.testing.couverts.nl/upload/fotos/1/3cb6fa5f-9327-426b-aa71-9b3dbc95d11a.jpg</Foto>
-      <Foto>http://restaurant.testing.couverts.nl/upload/fotos/1/db4d804f-6278-4be6-8c44-b3215a5ed871.jpg</Foto>
-      <Foto>http://restaurant.testing.couverts.nl/upload/fotos/1/153d4480-a124-49ba-8a78-dea1e9bebcc9.jpg</Foto>
-      <Foto>http://restaurant.testing.couverts.nl/upload/fotos/1/9cc11b58-1700-4783-b8ac-e363b49582d5.jpg</Foto>
-    </Fotos>
-    <Keukens>
-      <Keuken>Aziatisch</Keuken>
-      <Keuken>Bistro</Keuken>
-      <Keuken>Fondue</Keuken>
-      <Keuken>Pannenkoeken</Keuken>
-    </Keukens>
-    <MenuKaart>/upload/menukaarten/2012/10/25/420679ec94ff810d88942155fa2f788e-NMock3CheatSheet.pdf</MenuKaart>
-    <Reviews>
-      <Review>
-        <Datum>2015-04-28T13:26:21.6561632</Datum>
-        <Door>test bij max</Door>
-        <GemiddeldeScore>7.3</GemiddeldeScore>
-        <Titel>Geen stijl</Titel>
-        <Bericht>We zijn erg benieuwd hoe je etentje was! Laat je mening achter op Couverts.nl. Selecteer het aantal sterren dat jij het restaurant op basis van je eigen ervaring wil toekennen. Vervolgens onderbouw je je keuze zo nauwkeurig mogelijk in het opmerkingenveld. Door je review achter te laten, help je andere consumenten om de juiste restaurantkeuze te maken én weten restaurants waar zij zich in kunnen ontwikkelen. Je mening is dus veel waard!</Bericht>
-      </Review>
-      <Review>
-        <Datum>2015-04-24T17:42:50.8882283</Datum>
-        <Door>Freek</Door>
-        <GemiddeldeScore>6.0</GemiddeldeScore>
-        <Titel>test</Titel>
-        <Bericht>qwe</Bericht>
-      </Review>
-      <Review>
-        <Datum>2015-04-24T17:13:53.0787636</Datum>
-        <Door>Max</Door>
-        <GemiddeldeScore>7.7</GemiddeldeScore>
-        <Titel>estseesg</Titel>
-        <Bericht>mogelijk in het opmerkingenveld. Door je review achter te laten, help je andere consumenten om de juiste restaurantkeuze te maken én weten restaurants waar zij zich in kunnen ontwikkelen. Je mening is dus veel waard!</Bericht>
-      </Review>
-      <Review>
-        <Datum>2015-04-24T17:10:47.3058781</Datum>
-        <Door>test reviewer</Door>
-        <GemiddeldeScore>5.0</GemiddeldeScore>
-        <Titel>test review</Titel>
-        <Bericht>test test</Bericht>
-      </Review>
-      <Review>
-        <Datum>2015-04-22T16:31:11.9572425</Datum>
-        <Door>Roelie</Door>
-        <GemiddeldeScore>7.7</GemiddeldeScore>
-        <Titel>Testen </Titel>
-        <Bericht>	Couverts Test</Bericht>
-      </Review>
-    </Reviews>
-    <GemiddeldeScore>6.0</GemiddeldeScore>
-    <GemiddeldePrijsHoofdMenu>2.00</GemiddeldePrijsHoofdMenu>
-    <CouvertsURL>http://tescouvertsnl.cloudapp.net/restaurant/eindhoven/freeks-restaurant</CouvertsURL>
-    <AdWordsNaam>freeksrest</AdWordsNaam>
-  </Restaurant>
-*/
